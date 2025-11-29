@@ -1,0 +1,19 @@
+{
+  "name": "tg-subscription-bot-codes",
+  "version": "1.0.0",
+  "description": "Telegram bot to sell subscriptions and generate access codes (Telegraf + Stripe)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2",
+    "mysql2": "^3.15.3",
+    "node-telegram-bot-api": "^0.66.0",
+    "stripe": "^12.0.0",
+    "telegraf": "^4.13.0"
+  }
+}
