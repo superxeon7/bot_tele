@@ -55,6 +55,7 @@ const authHandler = require('./handlers/authHandler');
 const subscriptionHandler = require('./handlers/subscriptionHandler.js');
 const deviceHandler = require('./handlers/deviceHandler.js');
 const controlHandler = require('./handlers/controlHandler.js');
+const debugHelper = require('./handlers/debugHelper');
 
 // =====================================================
 // AUTO CLEANUP
@@ -188,6 +189,7 @@ bot.onText(/\/files/, controlHandler.filesControl);
 bot.onText(/\/mic/, controlHandler.micControl);
 bot.onText(/\/notif/, controlHandler.notificationControl);
 
+bot.onText(/\/debug/, debugHelper.debugDevice);
 // Callback query handler
 bot.on("callback_query", (query) => {
   const chatId = query.message.chat.id;
